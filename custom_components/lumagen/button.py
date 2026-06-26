@@ -29,17 +29,17 @@ class LumagenButtonDescription:
 
 async def _press_show_aspect(entity: LumagenButton) -> None:
     """Show aspect information."""
-    await entity.coordinator.device.show_aspect()
+    await entity.coordinator.async_show_aspect()
 
 
 async def _press_input_restart(entity: LumagenButton) -> None:
     """Restart Lumagen HDMI input connection."""
-    await entity.coordinator.device.input_restart()
+    await entity.coordinator.async_input_restart()
 
 
 async def _press_output_restart(entity: LumagenButton) -> None:
     """Restart Lumagen HDMI output connection."""
-    await entity.coordinator.device.output_restart()
+    await entity.coordinator.async_output_restart()
 
 
 async def _press_refresh_info(entity: LumagenButton) -> None:

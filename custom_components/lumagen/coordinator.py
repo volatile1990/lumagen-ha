@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from time import monotonic
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from lumagen_control import (
     LumagenDevice,
@@ -55,9 +58,14 @@ _LOGGER = logging.getLogger(__name__)
 POWER_OFF_IGNORE_AFTER_POWER_ON_SECONDS = 5.0
 OUTPUT_REFRESH_DELAY_SECONDS = 3.0
 OUTPUT_REFRESH_RETRY_DELAY_SECONDS = 30.0
+RECOVERY_POLL_INTERVAL = timedelta(seconds=30)
 LUMAGEN_TIMEOUT_ERRORS = (TimeoutError, asyncio.TimeoutError)
 
 StatusValue = str | int | float | bool | None
+
+
+class LumagenCommunicationError(HomeAssistantError):
+    """Raised when communication with the Lumagen fails."""
 
 
 @dataclass(frozen=True)
@@ -115,7 +123,7 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
             _LOGGER,
             config_entry=config_entry,
             name=DOMAIN,
-            update_interval=None,
+            update_interval=RECOVERY_POLL_INTERVAL,
             always_update=False,
         )
 
@@ -125,11 +133,11 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
 
     async def _async_update_data(self) -> LumagenCoordinatorData:
         """Fetch startup data from the Lumagen."""
+        was_unavailable = self.data is not None and not self.data.available
+
         try:
             async with self._lumagen_lock:
-                if not self._connected:
-                    await self.device.connect()
-                    self._connected = True
+                await self._async_ensure_connected()
 
                 power_status = await self.device.query_power()
                 power_on = _power_on(power_status, default=False)
@@ -138,10 +146,13 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
 
             status = self._parse_full_status(full_status)
 
-        except LUMAGEN_TIMEOUT_ERRORS:
-            return self._handle_update_failure("Timed out querying Lumagen state")
-        except OSError as err:
-            return self._handle_update_failure(
+        except LUMAGEN_TIMEOUT_ERRORS as err:
+            return await self._async_handle_update_failure(
+                "Timed out querying Lumagen state",
+                err,
+            )
+        except (OSError, RuntimeError) as err:
+            return await self._async_handle_update_failure(
                 f"Error querying Lumagen state; marking unavailable: {err}",
                 err,
             )
@@ -165,6 +176,32 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
             await self._add_horizontal_status(status)
 
         input_labels = self._current_input_labels()
+
+        if input_labels is None or was_unavailable:
+            try:
+                input_labels = await self._async_query_input_labels()
+            except LUMAGEN_TIMEOUT_ERRORS as err:
+                return await self._async_handle_update_failure(
+                    "Timed out loading Lumagen input labels during recovery",
+                    err,
+                )
+            except (OSError, RuntimeError) as err:
+                return await self._async_handle_update_failure(
+                    f"Failed to load Lumagen input labels during recovery: {err}",
+                    err,
+                )
+            except ValueError as err:
+                _LOGGER.debug(
+                    "Invalid Lumagen input label response; keeping cached labels: %s",
+                    err,
+                )
+                input_labels = self._current_input_labels()
+
+                if input_labels is None:
+                    return await self._async_handle_update_failure(
+                        "Invalid Lumagen input label response during recovery",
+                        err,
+                    )
 
         if input_labels is None:
             self._schedule_input_labels_load()
@@ -192,6 +229,7 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
         _LOGGER.debug("Lumagen unsolicited event: %s", event)
 
         if event.startswith("!S02,"):
+            was_unavailable = self.data is not None and not self.data.available
             power_status = self.device.parse_power_event(event)
             power_on = _power_on(
                 power_status,
@@ -204,6 +242,13 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
 
             if power_on:
                 self._ignore_power_off_until = 0.0
+
+            if power_on and was_unavailable:
+                self.hass.async_create_task(
+                    self.async_request_refresh(),
+                    "lumagen_refresh_after_power_event",
+                )
+                return
 
             self.async_set_updated_data(
                 LumagenCoordinatorData(
@@ -273,8 +318,7 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
             monotonic() + POWER_OFF_IGNORE_AFTER_POWER_ON_SECONDS
         )
 
-        async with self._lumagen_lock:
-            await self.device.power_on()
+        await self._async_run_device_command("turning Lumagen on", self.device.power_on)
 
         self.async_set_updated_data(
             LumagenCoordinatorData(
@@ -292,8 +336,10 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
         """Put the Lumagen in standby."""
         self._ignore_power_off_until = 0.0
 
-        async with self._lumagen_lock:
-            await self.device.standby()
+        await self._async_run_device_command(
+            "putting Lumagen in standby",
+            self.device.standby,
+        )
 
         self.async_set_updated_data(
             LumagenCoordinatorData(
@@ -309,8 +355,28 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
 
     async def async_select_input(self, input_number: int) -> None:
         """Select a Lumagen input."""
-        async with self._lumagen_lock:
-            await self.device.select_input(input_number)
+        try:
+            async with self._lumagen_lock:
+                await self._async_ensure_connected()
+                await self.device.select_input(input_number)
+        except LUMAGEN_TIMEOUT_ERRORS as err:
+            await self._async_handle_command_failure(
+                f"Timed out selecting Lumagen input {input_number}; "
+                "marking unavailable",
+                err,
+            )
+            raise LumagenCommunicationError(
+                f"Lumagen is unavailable while selecting input {input_number}"
+            ) from err
+        except (OSError, RuntimeError) as err:
+            await self._async_handle_command_failure(
+                f"Error selecting Lumagen input {input_number}; "
+                f"marking unavailable: {err}",
+                err,
+            )
+            raise LumagenCommunicationError(
+                f"Lumagen is unavailable while selecting input {input_number}"
+            ) from err
 
         self.async_set_updated_data(
             LumagenCoordinatorData(
@@ -327,12 +393,20 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
     async def async_load_input_labels(self) -> None:
         """Load Lumagen input labels in the background."""
         try:
-            async with self._lumagen_lock:
-                input_labels = await self.device.query_input_labels("A")
-        except LUMAGEN_TIMEOUT_ERRORS:
-            _LOGGER.debug("Timed out loading Lumagen input labels")
+            input_labels = await self._async_query_input_labels()
+        except LUMAGEN_TIMEOUT_ERRORS as err:
+            await self._async_handle_command_failure(
+                "Timed out loading Lumagen input labels; marking unavailable",
+                err,
+            )
             return
-        except (OSError, RuntimeError, ValueError) as err:
+        except (OSError, RuntimeError) as err:
+            await self._async_handle_command_failure(
+                f"Failed to load Lumagen input labels; marking unavailable: {err}",
+                err,
+            )
+            return
+        except ValueError as err:
             _LOGGER.debug("Failed to load Lumagen input labels: %s", err)
             return
         finally:
@@ -352,10 +426,85 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
 
     async def async_shutdown(self) -> None:
         """Disconnect from the Lumagen."""
-        async with self._lumagen_lock:
-            await self.device.disconnect()
+        for task in (self._horizontal_refresh_task, self._input_labels_task):
+            if task is not None and not task.done():
+                task.cancel()
 
-        self._connected = False
+        async with self._lumagen_lock:
+            await self._async_disconnect_locked()
+
+    async def _async_ensure_connected(self) -> None:
+        """Connect to the Lumagen if the current transport is disconnected."""
+        if self._connected:
+            return
+
+        await self.device.connect()
+        self._connected = True
+
+    async def _async_disconnect_locked(self) -> None:
+        """Disconnect from the Lumagen while the Lumagen lock is held."""
+        try:
+            await self.device.disconnect()
+        except (OSError, RuntimeError, ValueError) as err:
+            _LOGGER.debug("Failed to disconnect Lumagen transport cleanly: %s", err)
+        finally:
+            self._connected = False
+
+    async def _async_query_input_labels(self) -> dict[int, str]:
+        """Query Lumagen input labels using the managed connection."""
+        async with self._lumagen_lock:
+            await self._async_ensure_connected()
+            return await self.device.query_input_labels("A")
+
+    async def _async_reset_connection(self) -> None:
+        """Reset the transport so the next poll or command reconnects."""
+        async with self._lumagen_lock:
+            await self._async_disconnect_locked()
+
+    async def _async_handle_update_failure(
+        self,
+        message: str,
+        err: BaseException | None = None,
+    ) -> LumagenCoordinatorData:
+        """Disconnect stale transport and return unavailable coordinator data."""
+        await self._async_reset_connection()
+        return self._handle_update_failure(message, err)
+
+    async def _async_handle_command_failure(
+        self,
+        message: str,
+        err: BaseException,
+    ) -> None:
+        """Mark the coordinator unavailable after a command failure."""
+        data = await self._async_handle_update_failure(message, err)
+        self.async_set_updated_data(data)
+
+    async def _async_run_device_command(
+        self,
+        action: str,
+        command: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Run a Lumagen command with reconnect and failure handling."""
+        try:
+            async with self._lumagen_lock:
+                await self._async_ensure_connected()
+                await command()
+        except LUMAGEN_TIMEOUT_ERRORS as err:
+            await self._async_handle_command_failure(
+                f"Timed out {action}; marking unavailable",
+                err,
+            )
+            raise LumagenCommunicationError(
+                f"Lumagen is unavailable while {action}"
+            ) from err
+        except (OSError, RuntimeError) as err:
+            await self._async_handle_command_failure(
+                f"Error {action}; marking unavailable: {err}",
+                err,
+            )
+            raise LumagenCommunicationError(
+                f"Lumagen is unavailable while {action}"
+            ) from err
 
     def _handle_update_failure(
         self,
@@ -382,6 +531,35 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
             raise UpdateFailed(message)
 
         raise UpdateFailed(message) from err
+
+    async def async_send_remote_command(self, method_name: str) -> None:
+        """Send a simple remote command to the Lumagen."""
+        method = getattr(self.device, method_name)
+        await self._async_run_device_command(
+            f"sending Lumagen remote command {method_name}",
+            method,
+        )
+
+    async def async_show_aspect(self) -> None:
+        """Show aspect information."""
+        await self._async_run_device_command(
+            "showing Lumagen aspect information",
+            self.device.show_aspect,
+        )
+
+    async def async_input_restart(self) -> None:
+        """Restart Lumagen HDMI input connection."""
+        await self._async_run_device_command(
+            "restarting Lumagen HDMI input",
+            self.device.input_restart,
+        )
+
+    async def async_output_restart(self) -> None:
+        """Restart Lumagen HDMI output connection."""
+        await self._async_run_device_command(
+            "restarting Lumagen HDMI output",
+            self.device.output_restart,
+        )
 
     def _set_status(self, status: dict[str, StatusValue]) -> None:
         """Update only the status payload while preserving the rest of the data."""
@@ -492,9 +670,27 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
         label: str,
     ) -> None:
         """Set a Lumagen input label and update cached labels."""
-        async with self._lumagen_lock:
-            await self.device.set_input_label(memory, input_number, label)
-            await self.device.save_config()
+        try:
+            async with self._lumagen_lock:
+                await self._async_ensure_connected()
+                await self.device.set_input_label(memory, input_number, label)
+                await self.device.save_config()
+        except LUMAGEN_TIMEOUT_ERRORS as err:
+            await self._async_handle_command_failure(
+                "Timed out setting Lumagen input label; marking unavailable",
+                err,
+            )
+            raise LumagenCommunicationError(
+                "Lumagen is unavailable while setting input label"
+            ) from err
+        except (OSError, RuntimeError) as err:
+            await self._async_handle_command_failure(
+                f"Error setting Lumagen input label; marking unavailable: {err}",
+                err,
+            )
+            raise LumagenCommunicationError(
+                "Lumagen is unavailable while setting input label"
+            ) from err
 
         labels = dict(self._current_input_labels() or {})
 
@@ -523,19 +719,38 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
         """Set multiple Lumagen input labels and update cached labels."""
         labels = dict(self._current_input_labels() or {})
 
-        async with self._lumagen_lock:
-            for item in labels_to_set:
-                input_number = int(item["input_number"])
-                label = str(item["label"]).strip()
+        try:
+            async with self._lumagen_lock:
+                await self._async_ensure_connected()
 
-                await self.device.set_input_label(memory, input_number, label)
+                for item in labels_to_set:
+                    input_number = int(item["input_number"])
+                    label = str(item["label"]).strip()
 
-                if label:
-                    labels[input_number] = label
-                else:
-                    labels.pop(input_number, None)
+                    await self.device.set_input_label(memory, input_number, label)
 
-            await self.device.save_config()
+                    if label:
+                        labels[input_number] = label
+                    else:
+                        labels.pop(input_number, None)
+
+                await self.device.save_config()
+        except LUMAGEN_TIMEOUT_ERRORS as err:
+            await self._async_handle_command_failure(
+                "Timed out setting Lumagen input labels; marking unavailable",
+                err,
+            )
+            raise LumagenCommunicationError(
+                "Lumagen is unavailable while setting input labels"
+            ) from err
+        except (OSError, RuntimeError) as err:
+            await self._async_handle_command_failure(
+                f"Error setting Lumagen input labels; marking unavailable: {err}",
+                err,
+            )
+            raise LumagenCommunicationError(
+                "Lumagen is unavailable while setting input labels"
+            ) from err
 
         self.async_set_updated_data(
             LumagenCoordinatorData(
@@ -551,11 +766,16 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
 
     async def async_set_auto_aspect(self, enabled: bool) -> None:
         """Enable or disable Lumagen auto aspect."""
-        async with self._lumagen_lock:
-            if enabled:
-                await self.device.auto_aspect_enable()
-            else:
-                await self.device.auto_aspect_disable()
+        if enabled:
+            await self._async_run_device_command(
+                "enabling Lumagen auto aspect",
+                self.device.auto_aspect_enable,
+            )
+        else:
+            await self._async_run_device_command(
+                "disabling Lumagen auto aspect",
+                self.device.auto_aspect_disable,
+            )
 
     async def async_set_nls(self, enabled: bool) -> None:
         """Enable or disable Lumagen NLS."""
@@ -565,8 +785,10 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
         if current_enabled == enabled:
             return
 
-        async with self._lumagen_lock:
-            await self.device.toggle_nls()
+        await self._async_run_device_command(
+            "toggling Lumagen NLS",
+            self.device.toggle_nls,
+        )
 
     def _should_ignore_power_off(self) -> bool:
         """Return true if a power-off report is probably stale."""
@@ -607,11 +829,12 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
         """Add output horizontal field to a status payload."""
         try:
             async with self._lumagen_lock:
+                await self._async_ensure_connected()
                 output_info = await self.device.query_output_info()
         except LUMAGEN_TIMEOUT_ERRORS:
             _LOGGER.debug("Timed out loading Lumagen output horizontal status")
             return
-        except (OSError, ValueError) as err:
+        except (OSError, RuntimeError, ValueError) as err:
             _LOGGER.debug("Failed to load Lumagen output horizontal status: %s", err)
             return
 
@@ -621,6 +844,7 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
         """Refresh output horizontal resolution field."""
         try:
             async with self._lumagen_lock:
+                await self._async_ensure_connected()
                 output_info = await self.device.query_output_info()
         except LUMAGEN_TIMEOUT_ERRORS:
             self._horizontal_refresh_retry_after = (
@@ -631,7 +855,7 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
                 "keeping cached values"
             )
             return
-        except (OSError, ValueError) as err:
+        except (OSError, RuntimeError, ValueError) as err:
             self._horizontal_refresh_retry_after = (
                 monotonic() + OUTPUT_REFRESH_RETRY_DELAY_SECONDS
             )
@@ -652,6 +876,7 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
         """Refresh Lumagen runtime information."""
         try:
             async with self._lumagen_lock:
+                await self._async_ensure_connected()
                 power_status = await self.device.query_power()
                 power_on = _power_on(
                     power_status,
@@ -665,11 +890,20 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
             if status is not None:
                 await self._add_horizontal_status(status)
 
-        except LUMAGEN_TIMEOUT_ERRORS:
-            _LOGGER.debug("Timed out refreshing Lumagen information")
+        except LUMAGEN_TIMEOUT_ERRORS as err:
+            await self._async_handle_command_failure(
+                "Timed out refreshing Lumagen information; marking unavailable",
+                err,
+            )
             return
-        except (OSError, ValueError) as err:
-            _LOGGER.debug("Failed to refresh Lumagen information: %s", err)
+        except (OSError, RuntimeError) as err:
+            await self._async_handle_command_failure(
+                f"Failed to refresh Lumagen information; marking unavailable: {err}",
+                err,
+            )
+            return
+        except ValueError as err:
+            _LOGGER.debug("Invalid Lumagen refresh response: %s", err)
             return
 
         self.async_set_updated_data(
@@ -697,11 +931,12 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
 
         try:
             async with self._lumagen_lock:
+                await self._async_ensure_connected()
                 lumagen_id = await self.device.query_id()
         except LUMAGEN_TIMEOUT_ERRORS:
             _LOGGER.debug("Timed out refreshing Lumagen software version")
             return self._current_sw_version()
-        except (OSError, ValueError) as err:
+        except (OSError, RuntimeError, ValueError) as err:
             _LOGGER.debug("Failed to refresh Lumagen software version: %s", err)
             return self._current_sw_version()
 
@@ -710,24 +945,44 @@ class LumagenDataUpdateCoordinator(DataUpdateCoordinator[LumagenCoordinatorData]
 
     async def async_display_message(self, osd_message: LumagenOsdMessage) -> None:
         """Display a message on the Lumagen OSD."""
-        async with self._lumagen_lock:
-            await self.device.display_message(
-                duration=osd_message.duration,
-                options=OsdMessageOptions(
-                    message=osd_message.message,
-                    message_placement=osd_message.message_placement,
-                    block_char=osd_message.block_char,
-                    line1=osd_message.line1,
-                    line2=osd_message.line2,
-                    center_line1=osd_message.center_line1,
-                    center_line2=osd_message.center_line2,
-                ),
+        try:
+            async with self._lumagen_lock:
+                await self._async_ensure_connected()
+                await self.device.display_message(
+                    duration=osd_message.duration,
+                    options=OsdMessageOptions(
+                        message=osd_message.message,
+                        message_placement=osd_message.message_placement,
+                        block_char=osd_message.block_char,
+                        line1=osd_message.line1,
+                        line2=osd_message.line2,
+                        center_line1=osd_message.center_line1,
+                        center_line2=osd_message.center_line2,
+                    ),
+                )
+        except LUMAGEN_TIMEOUT_ERRORS as err:
+            await self._async_handle_command_failure(
+                "Timed out displaying Lumagen OSD message; marking unavailable",
+                err,
             )
+            raise LumagenCommunicationError(
+                "Lumagen is unavailable while displaying OSD message"
+            ) from err
+        except (OSError, RuntimeError) as err:
+            await self._async_handle_command_failure(
+                f"Error displaying Lumagen OSD message; marking unavailable: {err}",
+                err,
+            )
+            raise LumagenCommunicationError(
+                "Lumagen is unavailable while displaying OSD message"
+            ) from err
 
     async def async_clear_message(self) -> None:
         """Clear Lumagen OSD message."""
-        async with self._lumagen_lock:
-            await self.device.clear_message()
+        await self._async_run_device_command(
+            "clearing Lumagen OSD message",
+            self.device.clear_message,
+        )
 
 
 def create_lumagen_device(config_entry: ConfigEntry) -> LumagenDevice:

@@ -72,5 +72,4 @@ class LumagenRemote(LumagenEntity, RemoteEntity):  # pylint: disable=abstract-me
                 await self.coordinator.async_standby()
                 continue
 
-            method = getattr(self.coordinator.device, method_name)
-            await method()
+            await self.coordinator.async_send_remote_command(method_name)
